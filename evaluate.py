@@ -19,7 +19,6 @@ if not hasattr(logging.handlers.QueueListener, "_orig_monitor"):
 import json, importlib.util, sys, traceback
 from exogym.trainer import Trainer
 from nanogpt import GPT, GPTConfig, get_dataset
-import bittensor as bt
 
 # Set up logging - will output to stdout which gets captured by parent process
 logging.basicConfig(
@@ -29,13 +28,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-NUM_NODES = int(os.getenv("NUM_NODES", "4"))
-MAX_STEPS = int(os.getenv("MAX_STEPS", "100"))
+NUM_NODES = int(os.getenv("NUM_NODES", "2"))
+TIME_BUDGET = float(os.getenv("TIME_BUDGET", 1*60))
 MODEL_SIZE = os.getenv("MODEL_SIZE", "small")
-DATASET = os.getenv("DATASET", "owt")
+DATASET = os.getenv("DATASET", "shakespeare")
 DEVICE = os.getenv("DEVICE", "cuda")
 
-logger.info(f"MAX_STEPS: {MAX_STEPS}")
+logger.info(f"TIME_BUDGET: {TIME_BUDGET}s ({TIME_BUDGET/60:.1f}m)")
 logger.info(f"NUM_NODES: {NUM_NODES}")
 
 
@@ -49,7 +48,7 @@ def load_strategy(path):
 
 
 def main():
-    script_path = "/sandbox/strategy.py"
+    script_path = "strategy.py"
     try:
         strategy = script_path
         train_dataset, _ = get_dataset(
@@ -66,26 +65,41 @@ def main():
         trainer = Trainer(model, train_dataset, val_dataset, device=DEVICE)
 
         metrics_out = trainer.fit(
-            max_steps=MAX_STEPS,
+            time_budget_seconds=TIME_BUDGET,
             strategy=strategy,
             num_epochs=1,
             num_nodes=NUM_NODES,
             device=DEVICE,
             batch_size=256,
-            minibatch_size=16,
+            minibatch_size=32,
             shuffle=False,
             val_size=256,
             val_interval=10,
         )
 
-        # Extract the 3 integer metrics
-        result = {
-            "throughput": int(metrics_out.get("tokens_per_sec", 0)),
-            "loss": float(metrics_out.get("eval_loss", 0.0)),
-            "communication": int(metrics_out.get("comm_bytes_total", 0)),
-        }
-        logger.info(f"Training completed. Metrics: {result}")
-        print("\n" + json.dumps(result))  # output to stdout for parent process to parse
+        # # Extract the 3 integer metrics
+        # result = {
+        #     "throughput": int(metrics_out.get("tokens_per_sec", 0)),
+        #     "loss": float(metrics_out.get("eval_loss", 0.0)),
+        #     "communication": int(metrics_out.get("comm_bytes_total", 0)),
+        # }
+        # logger.info(f"Training completed. Metrics: {result}")
+        # print("\n" + json.dumps(result))  # output to stdout for parent process to parse
+
+        comm = int(metrics_out.get("comm_bytes_total", 0))
+        if comm >= 1 << 30:
+            comm_str = f"{comm / (1 << 30):.2f} GB"
+        elif comm >= 1 << 20:
+            comm_str = f"{comm / (1 << 20):.1f} MB"
+        elif comm >= 1 << 10:
+            comm_str = f"{comm / (1 << 10):.1f} KB"
+        else:
+            comm_str = f"{comm} B"
+
+        print("--------------------------------")
+        print(f"validation_loss:        {metrics_out.get('eval_loss', 0.0):.6f}")
+        print(f"communication_cost:     {comm_str} ({comm:,} bytes)")
+        print("--------------------------------")
 
     except Exception as e:
         logger.error(f"Sandbox execution failed: {e}", exc_info=True)

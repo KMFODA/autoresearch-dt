@@ -25,6 +25,7 @@ class TrainConfig:
 
     num_epochs: int = 1
     max_steps: Optional[int] = None
+    time_budget_seconds: Optional[float] = None
     batch_size: int = 16
     minibatch_size: int = 16
     shuffle: bool = True

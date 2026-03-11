@@ -47,6 +47,7 @@ class TrainNode(LogModule, CheckpointMixin, CorrelationMixin):
 
         self.num_epochs = config.num_epochs
         self.max_steps = config.max_steps
+        self.time_budget_seconds = config.time_budget_seconds
         self.batch_size = config.batch_size
         self.minibatch_size = config.minibatch_size
         self.val_size = config.val_size
@@ -280,6 +281,19 @@ class TrainNode(LogModule, CheckpointMixin, CorrelationMixin):
 
         start_time = time.time()
 
+        if self.time_budget_seconds is not None and self.max_steps is None:
+            PROBE_STEPS = 5
+            probe_start = time.time()
+            for _ in range(PROBE_STEPS):
+                self._train_step()
+                self.local_step += 1
+                if prof is not None:
+                    prof.step()
+                dist.barrier()
+            secs_per_step = (time.time() - probe_start) / PROBE_STEPS
+            remaining = self.time_budget_seconds - (time.time() - start_time)
+            self.max_steps = self.local_step + max(1, int(remaining / secs_per_step))
+
         if self.max_steps is None:
             self.max_steps = (
                 self.num_epochs
@@ -291,13 +305,13 @@ class TrainNode(LogModule, CheckpointMixin, CorrelationMixin):
 
         if self.rank == 0:
             if self.kwargs.get("disable_logging", False):
-                # Use base Logger for no-op logging during profiling
                 self.logger = Logger(
                     model=self.model,
                     max_steps=self.max_steps,
                     strategy=self.strategy,
                     train_node=self,
                     init_tqdm=False,
+                    time_budget_seconds=self.time_budget_seconds,
                 )
             elif self.kwargs.get("wandb_project", None) is not None:
                 self.logger = WandbLogger(
@@ -308,6 +322,7 @@ class TrainNode(LogModule, CheckpointMixin, CorrelationMixin):
                     wandb_project=self.kwargs.get("wandb_project", None),
                     run_name=self.kwargs.get("run_name", None),
                     x_axis=self.kwargs.get("log_x_axis", "step"),
+                    time_budget_seconds=self.time_budget_seconds,
                 )
             else:
                 self.logger = CSVLogger(
@@ -316,9 +331,17 @@ class TrainNode(LogModule, CheckpointMixin, CorrelationMixin):
                     strategy=self.strategy,
                     train_node=self,
                     run_name=self.kwargs.get("run_name", f"run_{os.getpid()}"),
+                    time_budget_seconds=self.time_budget_seconds,
                 )
 
-        while self.local_step < self.max_steps:
+        def _should_continue():
+            if self.local_step >= self.max_steps:
+                return False
+            if self.time_budget_seconds is not None:
+                return (time.time() - start_time) < self.time_budget_seconds
+            return True
+
+        while _should_continue():
             if self.local_step % self.val_interval == 0:
                 self._evaluate()
 
@@ -331,7 +354,6 @@ class TrainNode(LogModule, CheckpointMixin, CorrelationMixin):
             if self.rank == 0:
                 self.logger.increment_step()
 
-            # Calculate correlation if interval is set and it's time
             if (
                 self.config.correlation_interval
                 and self.local_step > 0

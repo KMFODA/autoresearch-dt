@@ -1,4 +1,5 @@
 from tqdm import tqdm
+import time as _time
 import numpy as np
 from torch import nn
 
@@ -8,7 +9,13 @@ import json
 import os
 from datetime import datetime
 import csv
-from typing import Literal
+from typing import Literal, Optional
+
+
+def _fmt_secs(s):
+    m, s = divmod(int(s), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 class Logger:
@@ -20,18 +27,19 @@ class Logger:
         train_node=None,
         extra_config=None,
         init_tqdm=True,
+        time_budget_seconds: Optional[float] = None,
     ):
         self.model = model
         self.max_steps = max_steps
+        self.time_budget_seconds = time_budget_seconds
+        self._start_time = _time.time()
 
-        # Create configuration once in parent class
         self.config = create_config(
             model=model,
             strategy=strategy,
             train_node=train_node,
             extra_config=extra_config or {},
         )
-        # Add max_steps to config if not already there
         if "max_steps" not in self.config:
             self.config["max_steps"] = max_steps
 
@@ -39,16 +47,26 @@ class Logger:
         self.current_lr = 0
         self.examples_trained = 0
 
-        # Initialize tqdm if requested (can be delayed by child classes)
         if init_tqdm:
-            self.pbar = tqdm(total=self.max_steps, initial=0)
+            self._init_pbar()
         else:
             self.pbar = None
+
+    def _init_pbar(self):
+        if self.time_budget_seconds is not None:
+            self.pbar = tqdm(
+                total=int(self.time_budget_seconds),
+                initial=0,
+                unit="s",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}s [{postfix}]",
+            )
+        else:
+            self.pbar = tqdm(total=self.max_steps, initial=self.step)
 
     def init_tqdm(self):
         """Initialize tqdm progress bar - can be called by child classes after their setup"""
         if self.pbar is None:
-            self.pbar = tqdm(total=self.max_steps, initial=self.step)
+            self._init_pbar()
 
     def log(self, data: dict):
         """Log arbitrary data - no-op in base logger"""
@@ -65,15 +83,25 @@ class Logger:
     def log_examples_trained(self, examples: int):
         self.examples_trained += examples
 
-    def log_train(self, loss: float):
-        if self.pbar:
+    def _update_pbar(self, loss: float):
+        if not self.pbar:
+            return
+        postfix = {
+            "step": self.step,
+            "train_loss": f"{loss:.4f}",
+            "lr": f"{self.current_lr:.6f}",
+        }
+        if self.time_budget_seconds is not None:
+            elapsed = _time.time() - self._start_time
+            self.pbar.n = min(int(elapsed), int(self.time_budget_seconds))
+            self.pbar.set_postfix(postfix)
+            self.pbar.refresh()
+        else:
             self.pbar.update(1)
-            self.pbar.set_postfix(
-                {
-                    "train_loss": f"{loss:.4f}",
-                    "lr": f"{self.current_lr:.6f}",
-                }
-            )
+            self.pbar.set_postfix(postfix)
+
+    def log_train(self, loss: float):
+        self._update_pbar(loss)
 
     def increment_step(self):
         self.step += 1
@@ -100,6 +128,7 @@ class WandbLogger(Logger):
         wandb_project: str = None,
         run_name: str = None,
         x_axis: Literal["step", "examples"] = "step",
+        time_budget_seconds: Optional[float] = None,
     ):
         try:
             import wandb
@@ -108,13 +137,13 @@ class WandbLogger(Logger):
                 "wandb is not installed. Please install it using `pip install wandb`."
             )
 
-        # Pass extra config to parent, delay tqdm initialization
         extra_config = {
             "wandb_project": wandb_project,
             "x_axis": x_axis,
         }
         super().__init__(
-            model, max_steps, strategy, train_node, extra_config, init_tqdm=False
+            model, max_steps, strategy, train_node, extra_config, init_tqdm=False,
+            time_budget_seconds=time_budget_seconds,
         )
 
         self.wandb_project = wandb_project
@@ -176,13 +205,7 @@ class WandbLogger(Logger):
             elif self.x_axis == "examples":
                 wandb.log(data, step=self.examples_trained)
 
-        self.pbar.update(1)
-        self.pbar.set_postfix(
-            {
-                "train_loss": f"{loss:.4f}",
-                "lr": f"{self.current_lr:.6f}",
-            }
-        )
+        self._update_pbar(loss)
 
     def log_info(self, value: float, name: str):
         import wandb
@@ -204,14 +227,15 @@ class CSVLogger(Logger):
         train_node=None,
         log_dir: str = "logs",
         run_name: str = None,
+        time_budget_seconds: Optional[float] = None,
     ):
-        # Pass extra config to parent, delay tqdm initialization
         extra_config = {
             "run_name": run_name,
             "log_dir": log_dir,
         }
         super().__init__(
-            model, max_steps, strategy, train_node, extra_config, init_tqdm=False
+            model, max_steps, strategy, train_node, extra_config, init_tqdm=False,
+            time_budget_seconds=time_budget_seconds,
         )
 
         # Create run directory
@@ -340,14 +364,7 @@ class CSVLogger(Logger):
 
         self._write_csv_row(self.train_csv_path, data)
 
-        # Update progress bar
-        self.pbar.update(1)
-        self.pbar.set_postfix(
-            {
-                "train_loss": f"{loss:.4f}",
-                "lr": f"{self.current_lr:.6f}",
-            }
-        )
+        self._update_pbar(loss)
 
     def log_info(self, value: float, name: str):
         """Log training loss to CSV"""
