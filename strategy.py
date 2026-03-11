@@ -424,7 +424,7 @@ class DiLoCoStrategy(CommunicateOptimizeStrategy):
 
 
 STRATEGY = DiLoCoStrategy(
-    optim_spec=OptimSpec(torch.optim.AdamW, lr=0.001),
+    optim_spec=OptimSpec(torch.optim.AdamW, lr=0.001, weight_decay=0.1),
     lr_scheduler="lambda_cosine",
     lr_scheduler_kwargs={
         "warmup_steps": 500,
