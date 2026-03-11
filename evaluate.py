@@ -29,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 NUM_NODES = int(os.getenv("NUM_NODES", "2"))
-TIME_BUDGET = float(os.getenv("TIME_BUDGET", 1*60))
+TIME_BUDGET = float(os.getenv("TIME_BUDGET", 5*60))
 MODEL_SIZE = os.getenv("MODEL_SIZE", "small")
 DATASET = os.getenv("DATASET", "shakespeare")
 DEVICE = os.getenv("DEVICE", "cuda")
