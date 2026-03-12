@@ -1,4 +1,5 @@
 import math
+import datetime
 import torch
 import torch.nn.utils as nn_utils
 import torch.distributed as dist
@@ -6,7 +7,7 @@ import torch.distributed as dist
 from copy import deepcopy
 from dataclasses import dataclass
 from torch.optim.lr_scheduler import LambdaLR
-from typing import List, Type, Union, Optional, Dict, Any
+from typing import List, Tuple, Type, Union, Optional, Dict, Any
 from abc import ABC, abstractmethod
 
 from exogym.aux.utils import LogModule
@@ -423,7 +424,117 @@ class DiLoCoStrategy(CommunicateOptimizeStrategy):
         )
 
 
-STRATEGY = DiLoCoStrategy(
+class UniformKBitQuantizer:
+    def __init__(self, n_bins: int, range_in_sigmas: float):
+        assert n_bins > 0 and (n_bins & (n_bins - 1)) == 0
+        self.n_bins = n_bins
+        self.range = range_in_sigmas
+
+    @torch.no_grad()
+    def quantize(self, val: torch.Tensor):
+        offset = self.n_bins // 2
+        shift = val.mean()
+        centered = val - shift
+        std = centered.norm() / math.sqrt(max(centered.numel() - 1, 1))
+        scale = self.range * std / self.n_bins
+        if scale.item() == 0 or not torch.isfinite(scale):
+            scale = torch.tensor(1.0, device=val.device)
+        q = ((centered / scale) + offset).round().clamp(0, self.n_bins - 1).to(torch.uint8)
+        original_shape = q.shape
+        q_flat = q.flatten()
+        pack = 4
+        pad = (pack - q_flat.numel() % pack) % pack
+        if pad:
+            q_flat = torch.cat([q_flat, torch.zeros(pad, dtype=torch.uint8, device=q_flat.device)])
+        r = q_flat.view(-1, pack)
+        packed = r[:, 0] | (r[:, 1] << 2) | (r[:, 2] << 4) | (r[:, 3] << 6)
+        return packed, (shift, scale, original_shape, pad)
+
+    @torch.no_grad()
+    def dequantize(self, packed: torch.Tensor, meta: Tuple):
+        shift, scale, shape, pad = meta
+        offset = self.n_bins // 2
+        mask = torch.tensor(3, dtype=torch.uint8, device=packed.device)
+        unpacked = torch.stack([(packed >> i) & mask for i in (0, 2, 4, 6)], dim=0).transpose(0, 1).flatten()
+        if pad:
+            unpacked = unpacked[:-pad]
+        return (unpacked.float() - offset) * scale + shift.to(unpacked.device)
+
+
+class SelectiveDiLoCoCommunicator(DiLoCoCommunicator):
+    """2-bit EF compression for embedding (wte) only; fp32 all_reduce for transformer layers."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.quantizer = UniformKBitQuantizer(n_bins=4, range_in_sigmas=4)
+        self.error_buffers = {}
+        self.gloo_group = None
+
+    def _init_node(self, model, rank: int, num_nodes: int) -> None:
+        self.gloo_group = dist.new_group(backend="gloo", timeout=datetime.timedelta(seconds=60))
+        self.master_model = deepcopy(model).to("cpu")
+        for param in self.master_model.parameters():
+            param.requires_grad = True
+        self.outer_optimizer = self.outer_optim_spec.build(self.master_model)
+        # Only buffer for embedding params
+        self.error_buffers = {
+            name: torch.zeros_like(p.data)
+            for name, p in self.master_model.named_parameters()
+            if "wte" in name
+        }
+
+    def communicate(self, model, rank: int, num_nodes: int, local_step: int) -> None:
+        if num_nodes > 1 and local_step % self.H == 0 and local_step > 0:
+            # fp32 all_reduce for transformer (non-embedding) params
+            for name, param in model.named_parameters():
+                if "wte" not in name:
+                    all_reduce(param.data, op=dist.ReduceOp.SUM)
+                    param.data /= num_nodes
+
+            self.outer_optimizer.zero_grad()
+            self._set_master_grad(model)
+
+            # 2-bit EF for embedding (wte) pseudo-gradients
+            for name, p in self.master_model.named_parameters():
+                if "wte" not in name:
+                    p.grad.copy_(p.grad)  # already correct from all_reduce above
+                    continue
+                delta = p.grad
+                delta_ef = delta + self.error_buffers[name]
+                q_packed, meta = self.quantizer.quantize(delta_ef)
+                shift, scale, shape, pad = meta
+                meta_tensor = torch.stack([shift.cpu(), scale.cpu()])
+                gathered_metas = [torch.zeros_like(meta_tensor) for _ in range(num_nodes)]
+                dist.all_gather(gathered_metas, meta_tensor, group=self.gloo_group)
+                gathered_q = [torch.empty_like(q_packed) for _ in range(num_nodes)]
+                dist.all_gather(gathered_q, q_packed, group=self.gloo_group)
+                delta_sum = torch.zeros_like(p.data)
+                for i in range(num_nodes):
+                    node_meta = (gathered_metas[i][0], gathered_metas[i][1], shape, pad)
+                    delta_sum += self.quantizer.dequantize(gathered_q[i], node_meta).reshape(p.shape)
+                delta_hat = delta_sum / num_nodes
+                my_decompressed = self.quantizer.dequantize(q_packed, meta).reshape(p.shape)
+                self.error_buffers[name].copy_(delta_ef - my_decompressed)
+                p.grad.copy_(delta_hat)
+
+            self.outer_optimizer.step()
+
+            # Broadcast master params to all workers
+            self._synchronize_master_model(model)
+            for param in model.parameters():
+                broadcast(param.data, src=0)
+
+
+class SelectiveDiLoCoStrategy(DiLoCoStrategy):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.diloco_comm = SelectiveDiLoCoCommunicator(
+            H=self.H, outer_optim_spec=self.diloco_comm.outer_optim_spec
+        )
+        self.communication_modules = [self.diloco_comm]
+
+
+STRATEGY = SelectiveDiLoCoStrategy(
     optim_spec=OptimSpec(torch.optim.AdamW, lr=0.001, weight_decay=0.1),
     outer_optim_spec=OptimSpec(torch.optim.SGD, lr=0.9, nesterov=True, momentum=0.9),
     lr_scheduler="lambda_cosine",
